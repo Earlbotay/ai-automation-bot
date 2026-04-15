@@ -7,18 +7,17 @@ import pexpect
 import platform
 from typing import AsyncGenerator
 
-# Fallback sequence: 3.0 Flash -> 3.0 Lite -> 2.5 Flash -> 2.5 Lite
+# Fallback sequence yang sah: 2.0 Flash -> 1.5 Flash -> 1.5 Flash-8B -> 1.5 Pro
 MODELS = [
-    "gemini-3.0-flash",
-    "gemini-3.0-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite"
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro"
 ]
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-API_KEY = os.getenv("GEMINI_API_KEY")
 
-SYSTEM_INSTRUCTION = """You are Gemini-Final, a high-level expert AI.
+SYSTEM_INSTRUCTION_BASE = """You are Gemini-Final, a high-level expert AI.
 You can execute code using pexpect, analyze the device environment, and generate images when requested.
 Current Device Environment:
 {env_info}
@@ -29,32 +28,23 @@ TOOLS_DEFINITION = [
         "function_declarations": [
             {
                 "name": "generate_image",
-                "description": "Generate an image based on a descriptive prompt. Trigger this when the user explicitly asks for an image, drawing, or picture.",
+                "description": "Generate an image based on a descriptive prompt.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "Detailed description of the image to generate"
-                        }
+                        "prompt": {"type": "string", "description": "Detailed description"}
                     },
                     "required": ["prompt"]
                 }
             },
             {
                 "name": "execute_shell",
-                "description": "Execute a shell command using pexpect with background input support.",
+                "description": "Execute a shell command using pexpect.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to run"
-                        },
-                        "input_text": {
-                            "type": "string",
-                            "description": "Optional input to send to the command"
-                        }
+                        "command": {"type": "string", "description": "Shell command"},
+                        "input_text": {"type": "string", "description": "Optional input"}
                     },
                     "required": ["command"]
                 }
@@ -64,59 +54,64 @@ TOOLS_DEFINITION = [
 ]
 
 def get_env_info():
-    info = {
+    return json.dumps({
         "os": platform.system(),
         "release": platform.release(),
         "machine": platform.machine(),
         "termux": "TERMUX_VERSION" in os.environ,
         "shell": os.environ.get("SHELL"),
         "cwd": os.getcwd()
-    }
-    return json.dumps(info, indent=2)
+    }, indent=2)
 
 async def chat_stream(message: str, history: list = None) -> AsyncGenerator[dict, None]:
     if history is None: history = []
     
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        yield {"type": "error", "content": "GEMINI_API_KEY not found"}
+        return
+
     current_model_idx = 0
     env_info = get_env_info()
     
     while current_model_idx < len(MODELS):
         model_name = MODELS[current_model_idx]
-        url = f"{GEMINI_API_BASE}/models/{model_name}:streamGenerateContent?alt=sse&key={API_KEY}"
+        url = f"{GEMINI_API_BASE}/models/{model_name}:streamGenerateContent?alt=sse&key={api_key}"
         
         payload = {
             "contents": history + [{"role": "user", "parts": [{"text": message}]}],
-            "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION.format(env_info=env_info)}]},
+            "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION_BASE.format(env_info=env_info)}]},
             "tools": TOOLS_DEFINITION,
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192}
+            "generationConfig": {"temperature": 0.7}
         }
 
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 async with client.stream("POST", url, json=payload) as response:
-                    if response.status_code == 429: # Rate limit
+                    if response.status_code == 429 or response.status_code == 404:
                         current_model_idx += 1
                         continue
                     
                     if response.status_code != 200:
-                        yield {"type": "error", "content": f"Error {response.status_code}"}
+                        err_text = await response.aread()
+                        yield {"type": "error", "content": f"Error {response.status_code}: {err_text.decode()}"}
                         break
 
                     async for line in response.aiter_lines():
                         if not line.startswith("data: "): continue
-                        chunk = json.loads(line[6:])
-                        
-                        candidates = chunk.get("candidates", [])
-                        if not candidates: continue
-                        
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        for part in parts:
-                            if "text" in part:
-                                yield {"type": "text", "content": part["text"]}
-                            elif "functionCall" in part:
-                                fc = part["functionCall"]
-                                yield {"type": "tool", "name": fc["name"], "args": fc["args"]}
-                                # Auto-execute tool logic here or in sub-agent
+                        try:
+                            chunk = json.loads(line[6:])
+                            candidates = chunk.get("candidates", [])
+                            if not candidates: continue
+                            
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            for part in parts:
+                                if "text" in part:
+                                    yield {"type": "text", "content": part["text"]}
+                                elif "functionCall" in part:
+                                    fc = part["functionCall"]
+                                    yield {"type": "tool", "name": fc["name"], "args": fc["args"]}
+                        except: continue
                     break
         except Exception as e:
             current_model_idx += 1
