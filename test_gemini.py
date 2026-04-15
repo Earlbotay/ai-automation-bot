@@ -3,9 +3,10 @@ import os
 from gemini_engine import chat_stream
 
 async def test():
-    # Set API Key secara manual untuk ujian jika belum ada di env
+    # Pastikan API Key sudah diset di environment variable (GitHub Secrets)
     if not os.getenv("GEMINI_API_KEY"):
-        os.environ["GEMINI_API_KEY"] = "AIzaSyCMcwp6LAJMiiGRXkr4IHtkagtnn0-xpxw"
+        print("Error: GEMINI_API_KEY tidak ditemukan di environment!")
+        return
     
     print("Testing Gemini Connection...")
     async for chunk in chat_stream("Hai"):
